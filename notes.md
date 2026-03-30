@@ -434,6 +434,8 @@ BitNet b1.58 trains **natively** in low precision rather than compressing after 
 
 ---
 
+---
+
 ## Practical Tooling & Services
 
 ```mermaid
@@ -743,6 +745,58 @@ graph TD
 ```
 
 LoRA typically targets **`q_proj`** and **`v_proj`** (the Query and Value projection matrices in attention), as these have the highest impact on the model's behavior with the fewest parameters.
+
+---
+
+## KV Cache Optimization: TurboQuant
+
+> 📄 **Introduced By:** Google Research (upcoming at ICLR 2026)
+
+As model context lengths explode (from 8K to 1M+ tokens), the **KV (Key-Value) Cache** becomes the dominant bottleneck in GPU memory. If the KV cache is fully stored in FP16, long contexts will immediately cause Out-Of-Memory (OOM) errors even on 80GB GPUs.
+
+**TurboQuant** is a new, **training-free** algorithm designed to dramatically optimize KV cache storage, significantly reducing VRAM footprint without sacrificing model quality or requiring costly re-training.
+
+### Key Features of TurboQuant
+
+- **Extreme Compression:** Achieves 6x or higher compression (storing values at ~2.5–3.5 bits per parameter vs traditional 16-bit).
+- **Zero Accuracy Loss:** Extensive evaluations show lossless performance on difficult long-context benchmarks like "Needle in a Haystack" and LongBench.
+- **Training-Free / Data-Oblivious:** Does not require finetuning, calibration data, or structural changes to the model. Plugs into pre-trained models (LLaMA, Mistral, Gemma) seamlessly.
+- **Performance Boost:** Enables up to an 8x speedup in attention logit computation. Since less data is transferred between VRAM and the SMs (streaming multiprocessors), inference becomes substantially faster.
+
+### How TurboQuant Works
+
+TurboQuant operates as a completely data-oblivious two-stage pipeline:
+
+```mermaid
+flowchart TD
+    KV_IN["📥 Incoming FP16 KV Vectors"] --> PQ["🌀 Stage 1: PolarQuant"]
+    
+    subgraph S1["1. Rotation & Quantization"]
+        PQ --> ROT["Orthogonal Rotation\n(Distributes magnitude evenly)"]
+        ROT --> MAP["Map to Fixed Grids\n(High compression)"]
+        MAP --> ERROR["Calculate Residual\n(Quantization error)"]
+    end
+    
+    ERROR --> QJL["⚖️ Stage 2: QJL Correction"]
+    
+    subgraph S2["2. Residual Correction"]
+        QJL --> GAUSS["Project via Random\nGaussian Matrix"]
+        GAUSS --> SIGN["Store only Sign Bit\n(-1 or +1)"]
+        SIGN --> UNBIASED["Unbiased estimator\nfor residual error"]
+    end
+    
+    MAP --> CACHE["🗄️ Highly Compressed KV Cache\n(~2.5 - 3.5 bits/param)"]
+    UNBIASED --> CACHE
+    
+    CACHE --> INFERENCE["⚡ Faster, Low-Memory Inference"]
+```
+
+#### 1. PolarQuant (Rotation & Fixed-Grid Quantization)
+Normally, KV cache values are spiky and hard to quantize. PolarQuant applies a **random orthogonal rotation** to the vectors. This acts like a mathematical blender—it perfectly preserves the underlying geometry (dot products) while making the numerical distribution highly predictable. The smoothed data is then mapped to a highly compressed fixed grid.
+
+#### 2. QJL (Quantized Johnson-Lindenstrauss) Residual Correction
+After PolarQuant, there is a small amount of leftover quantization error. Typically, correcting this error requires storing many more bits. 
+Instead, TurboQuant projects this residual error matrix through a random Gaussian matrix and stores **only the sign bit (+1 or -1)**. Due to the Johnson-Lindenstrauss lemma, this 1-bit footprint provides a mathematically unbiased correction to the attention scores at inference time.
 
 ---
 
